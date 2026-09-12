@@ -1,0 +1,30 @@
+# Data — keep locally, never push
+data/
+
+# Model weights
+checkpoints/
+
+# TensorBoard logs
+runs/
+
+# Training outputs
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
