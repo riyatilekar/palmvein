@@ -32,6 +32,13 @@ class PalmVeinDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # IMPORTANT:
+        # __getitem__ should return a tensor, NOT an image.
+        # This is because the dataloader expects a tensor,
+        # that code then will have to be written in training 
+        # script.
+        #                                           -Anay
+
         path, label = self.samples[idx]
         img = Image.open(path)
         return img, label
