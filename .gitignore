@@ -1,5 +1,5 @@
 # Data — keep locally, never push
-data/
+# data/
 
 # Model weights
 checkpoints/
