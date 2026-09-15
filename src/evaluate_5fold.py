@@ -28,15 +28,17 @@ from pk_sampler import PKSampler
 
 PROCESSED_ROOT = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
-# Training config -- same defaults as train_supcon_step2.py. Lower these
-# temporarily if you just want to smoke-test the whole script runs before
-# committing to a full 5-fold run (5x the time of a single fold).
+# Reduced EPOCHS 40 -> 15 based on fold 0 evidence: train EER hit a 0% floor
+# by epoch 20 while test EER plateaued. DROPOUT_P adds regularization to the
+# head, matching your triplet-loss notebook's EmbeddingNet (which uses
+# Dropout(0.5) for the same reason -- ~240 images overfits fast otherwise).
 P, K = 12, 4
 BATCHES_PER_EPOCH = 30
-EPOCHS = 40
+EPOCHS = 15
 LR = 1e-4
 TEMPERATURE = 0.1
 SEED = 42
+DROPOUT_P = 0.5
 
 
 def freeze_all_but_layer4(model):
@@ -44,6 +46,12 @@ def freeze_all_but_layer4(model):
         param.requires_grad = False
     for param in model.model.layer4.parameters():
         param.requires_grad = True
+    for param in model.model.fc.parameters():
+        param.requires_grad = True
+
+
+def add_dropout_head(model, p=0.5, embed_dim=32):
+    model.model.fc = nn.Sequential(nn.Dropout(p=p), nn.Linear(512, embed_dim))
     for param in model.model.fc.parameters():
         param.requires_grad = True
 
@@ -86,6 +94,15 @@ def evaluate_open_set(model, dataset):
     idx = (fars - far_target).abs().argmin()
     frr_at_1pct_far = frrs[idx].item()
 
+    # "0 false positives" threshold: set right at the single highest-scoring
+    # impostor pair actually observed in this fold's test data. Zero of the
+    # tested impostor pairs cross this line, by construction. What matters
+    # is what fraction of GENUINE pairs also get rejected at that same
+    # strict line -- that's the real cost of a zero-observed-FAR target.
+    zero_far_threshold = imp.max().item()
+    tar_at_zero_far = (gen >= zero_far_threshold).float().mean().item()
+    n_impostor_pairs = imp.numel()
+
     model.train()
     return {
         "d_prime": d_prime.item(),
@@ -93,6 +110,9 @@ def evaluate_open_set(model, dataset):
         "frr_at_1pct_far": frr_at_1pct_far,
         "gen_mean": gen.mean().item(),
         "imp_mean": imp.mean().item(),
+        "tar_at_zero_far": tar_at_zero_far,
+        "zero_far_threshold": zero_far_threshold,
+        "n_impostor_pairs": n_impostor_pairs,
     }
 
 
@@ -103,6 +123,7 @@ def train_one_fold(fold_idx, train_subjects, test_subjects):
 
     model = ResNet18_32()
     freeze_all_but_layer4(model)
+    add_dropout_head(model, p=DROPOUT_P)
     set_train_mode_frozen_bn(model)
 
     criterion = SupConLoss(temperature=TEMPERATURE)
@@ -124,13 +145,21 @@ def train_one_fold(fold_idx, train_subjects, test_subjects):
             loss.backward()
             optimizer.step()
             epoch_losses.append(loss.item())
-        if epoch % 10 == 0 or epoch == EPOCHS - 1:
+        if epoch % 3 == 0 or epoch == EPOCHS - 1:
             print(f"  epoch {epoch:3d}  loss={sum(epoch_losses)/len(epoch_losses):.4f}  "
                   f"elapsed={time.time()-t0:.0f}s")
 
     metrics = evaluate_open_set(model, test_ds)
+    acc_at_eer = 100 * (1 - metrics["eer"])
+    acc_at_1pct_far = 100 * (1 - metrics["frr_at_1pct_far"])
+    tar_zero_far_pct = metrics["tar_at_zero_far"] * 100
     print(f"  fold {fold_idx} result: EER={metrics['eer']*100:.2f}%  "
-          f"FRR@1%FAR={metrics['frr_at_1pct_far']*100:.2f}%  d'={metrics['d_prime']:.3f}")
+          f"(accuracy@EER={acc_at_eer:.2f}%)  "
+          f"FRR@1%FAR={metrics['frr_at_1pct_far']*100:.2f}%  "
+          f"(accuracy@1%FAR={acc_at_1pct_far:.2f}%)  d'={metrics['d_prime']:.3f}")
+    print(f"  fold {fold_idx} 0-observed-FAR: threshold={metrics['zero_far_threshold']:.3f} "
+          f"(tested against {metrics['n_impostor_pairs']} impostor pairs)  "
+          f"genuine acceptance at that threshold={tar_zero_far_pct:.2f}%")
     return metrics
 
 
@@ -147,21 +176,44 @@ def main():
     eers = torch.tensor([m["eer"] for m in all_metrics])
     frrs = torch.tensor([m["frr_at_1pct_far"] for m in all_metrics])
     dprimes = torch.tensor([m["d_prime"] for m in all_metrics])
+    tars_zero_far = torch.tensor([m["tar_at_zero_far"] for m in all_metrics])
+    acc_at_eer = (1 - eers) * 100
+    acc_at_1pct_far = (1 - frrs) * 100
+    tars_zero_far_pct = tars_zero_far * 100
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 78)
     print("SUMMARY -- 5-fold subject-disjoint, open-set evaluation")
-    print("=" * 60)
-    print(f"{'Fold':<6}{'EER %':<12}{'FRR@1%FAR %':<16}{'d’':<8}")
+    print("=" * 78)
+    print(f"{'Fold':<6}{'EER %':<10}{'Acc@EER %':<12}{'FRR@1%FAR %':<14}{'Acc@1%FAR %':<14}"
+          f"{'d’':<8}{'GenAcc@0FAR %':<15}")
     for i, m in enumerate(all_metrics):
-        print(f"{i:<6}{m['eer']*100:<12.2f}{m['frr_at_1pct_far']*100:<16.2f}{m['d_prime']:<8.3f}")
-    print("-" * 60)
-    print(f"{'mean':<6}{eers.mean()*100:<12.2f}{frrs.mean()*100:<16.2f}{dprimes.mean():<8.3f}")
-    print(f"{'std':<6}{eers.std()*100:<12.2f}{frrs.std()*100:<16.2f}{dprimes.std():<8.3f}")
-    print("=" * 60)
+        print(f"{i:<6}{m['eer']*100:<10.2f}{100*(1-m['eer']):<12.2f}"
+              f"{m['frr_at_1pct_far']*100:<14.2f}{100*(1-m['frr_at_1pct_far']):<14.2f}"
+              f"{m['d_prime']:<8.3f}{m['tar_at_zero_far']*100:<15.2f}")
+    print("-" * 78)
+    print(f"{'mean':<6}{eers.mean()*100:<10.2f}{acc_at_eer.mean():<12.2f}"
+          f"{frrs.mean()*100:<14.2f}{acc_at_1pct_far.mean():<14.2f}"
+          f"{dprimes.mean():<8.3f}{tars_zero_far_pct.mean():<15.2f}")
+    print(f"{'std':<6}{eers.std()*100:<10.2f}{acc_at_eer.std():<12.2f}"
+          f"{frrs.std()*100:<14.2f}{acc_at_1pct_far.std():<14.2f}"
+          f"{dprimes.std():<8.3f}{tars_zero_far_pct.std():<15.2f}")
+    print("=" * 78)
 
     mean_eer = eers.mean().item() * 100
     print("\nWhat this means:")
     print(f"  Mean EER across 5 subject-disjoint folds: {mean_eer:.2f}% (+/- {eers.std().item()*100:.2f}%)")
+    print(f"  Equivalent accuracy at the EER threshold: {acc_at_eer.mean().item():.2f}%")
+    print(f"  Equivalent accuracy at a strict 1% FAR threshold: {acc_at_1pct_far.mean().item():.2f}%")
+    print(f"  Genuine acceptance if threshold is set to guarantee ZERO false accepts")
+    print(f"  on the impostor pairs actually tested this run: {tars_zero_far_pct.mean().item():.2f}% "
+          f"(+/- {tars_zero_far_pct.std().item():.2f}%)")
+    print("  This last number is the real cost of a '0 false positives' requirement --")
+    print("  it is NOT a guarantee of 0% FAR against future impostors, only against the")
+    print("  specific impostor pairs measured in this run. A larger test set would likely")
+    print("  push the required threshold even stricter, lowering this number further.")
+    print("  (\"Accuracy\" isn't a single fixed property here -- it depends on where you")
+    print("   set the acceptance threshold. These numbers show that tradeoff at three")
+    print("   different operating points.)")
     if mean_eer < 1:
         verdict = ("Excellent by research standards, competitive with reported "
                     "commercial biometric systems -- but verify with more test "
